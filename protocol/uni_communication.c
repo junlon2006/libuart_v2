@@ -22,16 +22,20 @@
  *
  **************************************************************************/
 #include "uni_communication.h"
+#include <string.h>
 
+/* Protocol configuration */
 #define DEFAULT_PROTOCOL_BUF_SIZE     (sizeof(struct header))
 #define PROTOCOL_BUF_GC_TRIGGER_SIZE  (1024 + sizeof(struct header))
 #define PROTOCOL_BUF_SUPPORT_MAX_SIZE (8192)
 
-//TODO need refactor, calculate by baud rate
+/* Timing configuration (adjust based on baud rate) */
 #define WAIT_ACK_TIMEOUT_MSEC         (200)
 #define TRY_RESEND_TIMES              (5)
+
+#ifndef NULL
 #define NULL                          ((void *)0)
-#define CHECK_NOT_NULL(ptr)           (ptr != NULL)
+#endif
 
 /*-----------------------------------------------------------------*/
 /*           layout of uart communication app protocol             */
@@ -50,19 +54,20 @@
 /*|RES|RES|RES|RES|RES|NACK|ACKED|ACK|*/
 /*------------------------------------*/
 
-typedef unsigned short CommChecksum;
-typedef unsigned char  CommSequence;
-typedef unsigned char  CommControl;
-typedef void*          InterruptHandle;
+typedef uint16_t CommChecksum;
+typedef uint8_t  CommSequence;
+typedef uint8_t  CommControl;
+typedef void*    InterruptHandle;
 
 typedef struct {
-  int reliable; /* 1 means this packet need acked, reliable transmission, 0 udp like */
+  int reliable; /* 1 = reliable transmission (TCP-like), 0 = unreliable (UDP-like) */
 } CommAttribute;
 
+/* Control bit flags */
 typedef enum {
-  ACK   = 0,  /* need ack */
-  ACKED = 1,  /* ack packet */
-  NACK  = 2,  /* nack packet */
+  ACK   = 0,  /* Packet requires acknowledgment */
+  ACKED = 1,  /* This is an acknowledgment packet */
+  NACK  = 2,  /* Negative acknowledgment (error) */
 } Control;
 
 typedef enum {
@@ -73,171 +78,51 @@ typedef enum {
   LAYOUT_PAYLOAD_LEN_CRC_LOW_IDX  = 15,
 } CommLayoutIndex;
 
+/* Protocol packet header structure */
 typedef struct header {
-  unsigned char sync[6];   /* must be "uArTcP" */
-  CommSequence  sequence;  /* sequence number */
-  CommControl   control;   /* header ctrl */
-  unsigned char cmd[2];    /* command type, such as power on, power off etc */
-  unsigned char checksum[2];         /* checksum of packet, use crc16 */
-  unsigned char payload_len[2];      /* the length of payload */
-  unsigned char payload_len_crc16[2];/* the crc16 of payload_len */
-  char          payload[0];          /* the payload */
+  unsigned char sync[6];             /* Magic bytes: "uArTcP" */
+  CommSequence  sequence;            /* Sequence number for ordering */
+  CommControl   control;             /* Control flags (ACK/ACKED/NACK) */
+  unsigned char cmd[2];              /* Command ID (big-endian) */
+  unsigned char checksum[2];         /* CRC16 of entire packet */
+  unsigned char payload_len[2];      /* Payload length (big-endian) */
+  unsigned char payload_len_crc16[2];/* CRC16 of payload_len */
+  char          payload[0];          /* Variable-length payload */
 } PACKED CommProtocolPacket;
 
+/* Protocol business logic state */
 typedef struct {
-  CommWriteHandler      on_write;
-  CommRecvPacketHandler on_recv_frame;
-  void*                 write_sync_lock;    /* avoid uart device write concurrency */
-  void*                 app_send_sync_lock; /* avoid app send concurrency, out of sequence */
-  int                   acked;
-  CommSequence          sequence;
-  short                 current_acked_seq;  /* current received sequence */
-  char                  *protocol_buffer;
-  InterruptHandle       interrupt_handle;
-  int                   sem_hooks_registered;
-  int                   inited;
+  CommWriteHandler      on_write;           /* UART write callback */
+  CommRecvPacketHandler on_recv_frame;      /* Packet receive callback */
+  void*                 write_sync_lock;    /* Mutex for UART write */
+  void*                 app_send_sync_lock; /* Mutex for app send calls */
+  int                   acked;              /* ACK received flag */
+  CommSequence          sequence;           /* Current sequence number */
+  short                 current_acked_seq;  /* Last ACKed sequence */
+  char                  *protocol_buffer;   /* Frame parsing buffer */
+  InterruptHandle       interrupt_handle;   /* Interruptible sleep handle */
+  int                   sem_hooks_registered; /* Semaphore hooks available */
+  int                   inited;             /* Initialization flag */
 } CommProtocolBusiness;
 
+/* Global state */
 static unsigned char        g_sync[6] = {'u', 'A', 'r', 'T', 'c', 'P'};
-static CommProtocolHooks    g_hooks   = {NULL};
-static CommProtocolBusiness g_comm_protocol_business;
+static CommProtocolHooks    g_hooks   = {0};
+static CommProtocolBusiness g_comm_protocol_business = {0};
 
-static unsigned short _byte2_big_endian_2_u16(unsigned char *buf) {
-  return ((unsigned short)buf[0] << 8) + (unsigned short)buf[1];
+/* Byte order conversion utilities */
+static uint16_t _byte2_big_endian_2_u16(unsigned char *buf) {
+  return ((uint16_t)buf[0] << 8) | (uint16_t)buf[1];
 }
 
-static void _u16_2_byte2_big_endian(unsigned short value, unsigned char *buf) {
+static void _u16_2_byte2_big_endian(uint16_t value, unsigned char *buf) {
   buf[0] = (unsigned char)(value >> 8);
   buf[1] = (unsigned char)(value & 0xFF);
 }
 
-#define OPSIZ      (sizeof(unsigned long int))
-#define OP_T_THRES (OPSIZ * 2)
-#define BYTE_COPY_FWD(dst_bp, src_bp, nbytes) \
-do {  \
-  unsigned int __nbytes = (nbytes);  \
-  while (__nbytes > 0) {  \
-    unsigned char __x = ((unsigned char *)src_bp)[0];  \
-    src_bp += 1;  \
-    __nbytes -= 1;  \
-    ((unsigned char *)dst_bp)[0] = __x;  \
-    dst_bp += 1;  \
-  }  \
-} while (0)
-
-#define WORD_COPY_FWD(dst_bp, src_bp, nwords) \
-do {  \
-  unsigned int __nwords = (nwords);  \
-  while (__nwords > 0) {  \
-    unsigned long int __x = ((unsigned long int *)src_bp)[0];  \
-    src_bp += OPSIZ;  \
-    __nwords -= 1;  \
-    ((unsigned long int *)dst_bp)[0] = __x;  \
-    dst_bp += OPSIZ;  \
-  }  \
-} while (0)
-
-/* src and dst never overlap. donot like memmove */
-static void* _memcpy(void *dst, const void *src, unsigned int len) {
-  unsigned long int dstp = (unsigned long int)dst;
-  unsigned long int srcp = (unsigned long int)src;
-
-  if (len >= OP_T_THRES) {
-    /* Copy just a few bytes to make DSTP aligned. */
-    len -= (-dstp) % OPSIZ;
-    BYTE_COPY_FWD(dstp, srcp, (-dstp) % OPSIZ);
-
-    /* Copy from SRCP to DSTP taking advantage of the known alignment of
-      DSTP.  Number of bytes remaining is put in the third argument,
-      i.e. in LEN.  This number may vary from machine to machine. */
-
-    WORD_COPY_FWD(dstp, srcp, len / OPSIZ);
-    len = len % OPSIZ;
-
-    /* Fall out and copy the tail.  */
-  }
-
-  /* There are just a few bytes to copy.  Use byte memory operations.  */
-  BYTE_COPY_FWD (dstp, srcp, len);
-
-  return dst;
-}
-
-static void* _memset(void *dstpp, int c, unsigned int len) {
-  long int dstp = (long int) dstpp;
-  if (len >= 8) {
-    unsigned int xlen;
-    unsigned long int cccc;
-
-    cccc = (unsigned char) c;
-    cccc |= cccc << 8;
-    cccc |= cccc << 16;
-    if (OPSIZ > 4) {
-      /* Do the shift in two steps to avoid warning if long has 32 bits. */
-      cccc |= (cccc << 16) << 16;
-    }
-
-    /* There are at least some bytes to set. No need to test for LEN == 0 in this alignment loop. */
-    while (dstp % OPSIZ != 0) {
-      ((unsigned char *) dstp)[0] = c;
-      dstp += 1;
-      len -= 1;
-    }
-
-    /* Write 8 `unsigned long int' per iteration until less than 8 `unsigned long int' remain. */
-    xlen = len / (OPSIZ * 8);
-    while (xlen > 0) {
-      ((unsigned long int *)dstp)[0] = cccc;
-      ((unsigned long int *)dstp)[1] = cccc;
-      ((unsigned long int *)dstp)[2] = cccc;
-      ((unsigned long int *)dstp)[3] = cccc;
-      ((unsigned long int *)dstp)[4] = cccc;
-      ((unsigned long int *)dstp)[5] = cccc;
-      ((unsigned long int *)dstp)[6] = cccc;
-      ((unsigned long int *)dstp)[7] = cccc;
-      dstp += 8 * OPSIZ;
-      xlen -= 1;
-    }
-    len %= OPSIZ * 8;
-
-    /* Write 1 `op_t' per iteration until less than OPSIZ bytes remain. */
-    xlen = len / OPSIZ;
-    while (xlen > 0) {
-      ((unsigned long int *) dstp)[0] = cccc;
-      dstp += OPSIZ;
-      xlen -= 1;
-    }
-    len %= OPSIZ;
-  }
-
-  /* Write the last few bytes. */
-  while (len > 0) {
-    ((unsigned char *) dstp)[0] = c;
-    dstp += 1;
-    len -= 1;
-  }
-
-  return dstpp;
-}
-
 void CommProtocolRegisterHooks(CommProtocolHooks *hooks) {
-  if (NULL == hooks) return;
-
-  /* dynamic memory alloc hooks */
-  g_hooks.malloc_fn  = hooks->malloc_fn;
-  g_hooks.free_fn    = hooks->free_fn;
-  g_hooks.realloc_fn = hooks->realloc_fn;
-
-  /* sleep hook */
-  g_hooks.msleep_fn = hooks->msleep_fn;
-
-  /* semaphore hooks */
-  g_hooks.sem_alloc_fn     = hooks->sem_alloc_fn;
-  g_hooks.sem_destroy_fn   = hooks->sem_destroy_fn;
-  g_hooks.sem_init_fn      = hooks->sem_init_fn;
-  g_hooks.sem_post_fn      = hooks->sem_post_fn;
-  g_hooks.sem_wait_fn      = hooks->sem_wait_fn;
-  g_hooks.sem_timedwait_fn = hooks->sem_timedwait_fn;
+  if (!hooks) return;
+  memcpy(&g_hooks, hooks, sizeof(CommProtocolHooks));
 }
 
 //--------------------- UTILS crc 16---------------------------
@@ -276,13 +161,12 @@ static const unsigned short crc16tab[256] = {
   0x6e17, 0x7e36, 0x4e55, 0x5e74, 0x2e93, 0x3eb2, 0x0ed1, 0x1ef0
 };
 
-static unsigned short _crc16(const char *buf, int len) {
+static uint16_t _crc16(const char *buf, int len) {
   int counter;
-  unsigned short crc = 0;
+  uint16_t crc = 0;
   for (counter = 0; counter < len; counter++) {
-    crc = (crc<<8) ^ crc16tab[((crc>>8) ^ *buf++) & 0x00FF];
+    crc = (crc << 8) ^ crc16tab[((crc >> 8) ^ *buf++) & 0x00FF];
   }
-
   return crc;
 }
 //--------------------- UTILS crc 16---------------------------
@@ -292,8 +176,8 @@ typedef struct {
   void *v;
 } Interruptable;
 
-static int _is_sem_hook_registered() {
-  return (1 == g_comm_protocol_business.sem_hooks_registered);
+static int _is_sem_hook_registered(void) {
+  return g_comm_protocol_business.sem_hooks_registered;
 }
 
 static InterruptHandle InterruptCreate() {
@@ -446,10 +330,9 @@ static CommPayloadLen _payload_len_get(CommProtocolPacket *packet) {
   return _byte2_big_endian_2_u16(packet->payload_len);
 }
 
-static void _payload_set(CommProtocolPacket *packet,
-                         char *buf, CommPayloadLen len) {
-  if (NULL != buf && 0 < len) {
-    _memcpy(packet->payload, buf, len);
+static void _payload_set(CommProtocolPacket *packet, char *buf, CommPayloadLen len) {
+  if (buf && len > 0) {
+    memcpy(packet->payload, buf, len);
   }
 }
 
@@ -494,7 +377,7 @@ static int _is_nacked_packet(CommProtocolPacket *protocol_packet) {
           _is_nacked_set(protocol_packet->control));
 }
 
-static int _wait_ack(CommAttribute *attribute, CommProtocolPacket *packet) {
+static int _wait_ack(CommAttribute *attribute, CommProtocolPacket *packet __attribute__((unused))) {
   /* acked process */
   if (NULL == attribute || !attribute->reliable) {
     return 0;
@@ -507,10 +390,10 @@ static int _wait_ack(CommAttribute *attribute, CommProtocolPacket *packet) {
 }
 
 static CommProtocolPacket* _packet_alloc(int payload_len) {
-  CommProtocolPacket *packet = (CommProtocolPacket *)g_hooks.malloc_fn(sizeof(CommProtocolPacket) +
-                                                                       payload_len);
+  CommProtocolPacket *packet = (CommProtocolPacket *)g_hooks.malloc_fn(
+      sizeof(CommProtocolPacket) + payload_len);
   if (packet) {
-    _memset(packet, 0, sizeof(CommProtocolPacket));
+    memset(packet, 0, sizeof(CommProtocolPacket));
   }
   return packet;
 }
@@ -879,21 +762,21 @@ static void _unregister_packet_receive_handler() {
   g_comm_protocol_business.on_recv_frame = NULL;
 }
 
-static int _check_hooks_valid() {
-  if (!CHECK_NOT_NULL(g_hooks.malloc_fn))  return -1;
-  if (!CHECK_NOT_NULL(g_hooks.free_fn))    return -1;
-  if (!CHECK_NOT_NULL(g_hooks.realloc_fn)) return -1;
-  if (!CHECK_NOT_NULL(g_hooks.msleep_fn))  return -1;
+static int _check_hooks_valid(void) {
+  if (!g_hooks.malloc_fn)  return -1;
+  if (!g_hooks.free_fn)    return -1;
+  if (!g_hooks.realloc_fn) return -1;
+  if (!g_hooks.msleep_fn)  return -1;
   return 0;
 }
 
-static void _check_sem_hooks_status() {
-  if (CHECK_NOT_NULL(g_hooks.sem_alloc_fn) &&
-      CHECK_NOT_NULL(g_hooks.sem_destroy_fn) &&
-      CHECK_NOT_NULL(g_hooks.sem_init_fn) &&
-      CHECK_NOT_NULL(g_hooks.sem_post_fn) &&
-      CHECK_NOT_NULL(g_hooks.sem_wait_fn) &&
-      CHECK_NOT_NULL(g_hooks.sem_timedwait_fn)) {
+static void _check_sem_hooks_status(void) {
+  if (g_hooks.sem_alloc_fn &&
+      g_hooks.sem_destroy_fn &&
+      g_hooks.sem_init_fn &&
+      g_hooks.sem_post_fn &&
+      g_hooks.sem_wait_fn &&
+      g_hooks.sem_timedwait_fn) {
     g_comm_protocol_business.sem_hooks_registered = 1;
   }
 }
@@ -905,8 +788,8 @@ static void _set_started_seq() {
   g_comm_protocol_business.sequence = (CommSequence)((unsigned long int)r1 ^ (unsigned long int)r2);
 }
 
-static void _protocol_business_init() {
-  _memset(&g_comm_protocol_business, 0, sizeof(g_comm_protocol_business));
+static void _protocol_business_init(void) {
+  memset(&g_comm_protocol_business, 0, sizeof(g_comm_protocol_business));
   _check_sem_hooks_status();
   g_comm_protocol_business.interrupt_handle = InterruptCreate();
   _set_current_acked_seq(((CommSequence)-1) >> 1);
@@ -931,7 +814,7 @@ static void _try_free_protocol_buffer() {
   }
 }
 
-static void _protocol_business_final() {
+static void _protocol_business_final(void) {
   if (g_comm_protocol_business.write_sync_lock) {
     g_hooks.sem_destroy_fn(g_comm_protocol_business.write_sync_lock);
   }
@@ -942,8 +825,8 @@ static void _protocol_business_final() {
 
   _try_free_protocol_buffer();
   InterruptDestroy(g_comm_protocol_business.interrupt_handle);
-  _memset(&g_comm_protocol_business, 0, sizeof(g_comm_protocol_business));
-  _memset(&g_hooks, 0, sizeof(g_hooks));
+  memset(&g_comm_protocol_business, 0, sizeof(g_comm_protocol_business));
+  memset(&g_hooks, 0, sizeof(g_hooks));
 }
 
 int CommProtocolInit(CommWriteHandler write_handler,

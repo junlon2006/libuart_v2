@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        compiler: [gcc, clang]
+        exclude:
+          - os: macos-latest
+            compiler: gcc
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Build with Make
+      run: |
+        make CC=${{ matrix.compiler }}
+
+    - name: Build with CMake
+      run: |
+        mkdir build
+        cd build
+        cmake .. -DCMAKE_C_COMPILER=${{ matrix.compiler }}
+        cmake --build .
+
+    - name: Build examples
+      run: |
+        make examples CC=${{ matrix.compiler }}
+
+  static-analysis:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install cppcheck
+      run: sudo apt-get install -y cppcheck
+
+    - name: Run cppcheck
+      run: cppcheck --enable=all --error-exitcode=1 --suppress=missingIncludeSystem protocol/
