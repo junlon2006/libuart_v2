@@ -28,10 +28,26 @@
 extern "C" {
 #endif
 
-#define PACKED              __attribute__ ((packed))
+#include <stdint.h>
 
-typedef unsigned short      CommCmd;
-typedef unsigned short      CommPayloadLen;
+/* Compiler-specific packed attribute */
+#if defined(__GNUC__) || defined(__clang__)
+#define PACKED __attribute__((packed))
+#elif defined(_MSC_VER)
+#define PACKED
+#pragma pack(push, 1)
+#else
+#define PACKED
+#endif
+
+/* Protocol configuration */
+#define COMM_CMD_MIN            1
+#define COMM_CMD_MAX            10000
+#define COMM_MAX_PAYLOAD_SIZE   8192
+
+/* Type definitions */
+typedef uint16_t            CommCmd;
+typedef uint16_t            CommPayloadLen;
 typedef int                 (*CommWriteHandler)(char *buf, unsigned int len);
 
 /**
@@ -43,79 +59,119 @@ typedef struct {
   char*          payload;     /**< 消息体 */
 } PACKED CommPacket;
 
+/**
+ * Error codes returned by protocol functions
+ */
 typedef enum {
-  E_UNI_COMM_ALLOC_FAILED = -10001,
-  E_UNI_COMM_BUFFER_PTR_NULL,
-  E_UNI_COMM_PAYLOAD_TOO_LONG,
-  E_UNI_COMM_PAYLOAD_ACK_TIMEOUT,
+  E_UNI_COMM_SUCCESS              = 0,      /**< Operation successful */
+  E_UNI_COMM_ALLOC_FAILED         = -10001, /**< Memory allocation failed */
+  E_UNI_COMM_BUFFER_PTR_NULL      = -10002, /**< Buffer pointer is NULL */
+  E_UNI_COMM_PAYLOAD_TOO_LONG     = -10003, /**< Payload exceeds max size */
+  E_UNI_COMM_PAYLOAD_ACK_TIMEOUT  = -10004, /**< ACK timeout in reliable mode */
+  E_UNI_COMM_NOT_INITIALIZED      = -10005, /**< Protocol not initialized */
+  E_UNI_COMM_INVALID_PARAM        = -10006, /**< Invalid parameter */
 } CommProtocolErrorCode;
 
 /**
- * 协议栈可移植函数钩子指针集合结构体，通过注册APIs实现平台移植
+ * Platform-specific function hooks for portability
+ * Register these functions to port the protocol to different platforms
  */
 typedef struct {
-  /* 动态内存分配相关的函数 */
-  void* (*malloc_fn)(unsigned long size);             /**< malloc hook */
-  void  (*free_fn)(void *ptr);                        /**< free hook */
-  void* (*realloc_fn)(void *ptr, unsigned long size); /**< realloc hook */
+  /* Memory management functions (REQUIRED) */
+  void* (*malloc_fn)(unsigned long size);             /**< Allocate memory */
+  void  (*free_fn)(void *ptr);                        /**< Free memory */
+  void* (*realloc_fn)(void *ptr, unsigned long size); /**< Reallocate memory */
 
-  /* 信号量相关的函数 */
-  void* (*sem_alloc_fn)(void);                         /**< 分配信号量句柄hook */
-  void  (*sem_destroy_fn)(void *sem);                  /**< 回收信号量句柄hook */
-  int   (*sem_init_fn)(void *sem, unsigned int value); /**< 信号量初始化hook */
-  int   (*sem_post_fn)(void *sem);                     /**< 信号量释放hook */
-  int   (*sem_wait_fn)(void *sem);                     /**< 信号量等待hook */
-  int   (*sem_timedwait_fn)(void *sem, unsigned int timeout_msecond); /**< 信号量超时等待hook */
+  /* Semaphore functions (OPTIONAL, recommended for thread safety) */
+  void* (*sem_alloc_fn)(void);                         /**< Allocate semaphore handle */
+  void  (*sem_destroy_fn)(void *sem);                  /**< Destroy semaphore */
+  int   (*sem_init_fn)(void *sem, unsigned int value); /**< Initialize semaphore */
+  int   (*sem_post_fn)(void *sem);                     /**< Post/signal semaphore */
+  int   (*sem_wait_fn)(void *sem);                     /**< Wait on semaphore */
+  int   (*sem_timedwait_fn)(void *sem, unsigned int timeout_msecond); /**< Timed wait on semaphore */
 
-  /* 睡眠函数 */
-  int (*msleep_fn)(unsigned int msecond); /**< 睡眠hook */
+  /* Sleep function (REQUIRED) */
+  int (*msleep_fn)(unsigned int msecond); /**< Sleep for milliseconds */
 } CommProtocolHooks;
 
 typedef void (*CommRecvPacketHandler)(CommPacket *packet);
 
 /**
- * @brief     协议栈依赖的可移植函数，需要根据系统实际情况，进行注册
- * @param[in] hooks 注册函数指针集结构体
- * @return    void
+ * @brief Register platform-specific hooks for protocol portability
+ * 
+ * Must be called before CommProtocolInit(). Registers memory management,
+ * synchronization, and sleep functions required by the protocol stack.
+ * 
+ * @param[in] hooks Pointer to hooks structure with platform functions
+ * @note Required hooks: malloc_fn, free_fn, realloc_fn, msleep_fn
+ * @note Optional hooks: semaphore functions (for thread safety)
  */
 void CommProtocolRegisterHooks(CommProtocolHooks *hooks);
 
 /**
- * @brief     协议栈初始化函数
- * @param[in] write_handler 函数指针，用于注册串口发送函数到协议栈中
- * @param[in] recv_handler  协议栈解析出数据后，封装成struct CommPacket回调给应用层
- * @return    错误码，0代表成功，-1代表失败
+ * @brief Initialize the protocol stack
+ * 
+ * Initializes internal state, allocates resources, and registers callbacks.
+ * Must be called after CommProtocolRegisterHooks().
+ * 
+ * @param[in] write_handler UART write function callback for sending data
+ * @param[in] recv_handler  Callback invoked when a packet is received
+ * @return 0 on success, -1 on failure
+ * @note write_handler will be called from protocol context
+ * @note recv_handler must NOT call CommProtocolPacketAssembleAndSend directly
  */
 int CommProtocolInit(CommWriteHandler write_handler, CommRecvPacketHandler recv_handler);
 
 /**
- * @brief 协议栈反注册函数，用于释放所有资源
- * @param void
- * @return void
+ * @brief Cleanup and release all protocol resources
+ * 
+ * Frees all allocated memory and resets internal state.
+ * Should rarely be called in embedded systems.
  */
 void CommProtocolFinal(void);
 
 /**
- * @brief                 协议栈发送消息函数，根据mode选择发送模式
- * @param[in] cmd         发送消息的类型，该类型是全局唯一的，标识一个消息类型，取值[1, 10000]闭区间，其他值不可用
- * @param[in] payload     cmd对应的消息包含的参数，如没有参数则设置为NULL
- * @param[in] payload_len cmd对应的消息参数的长度，如果没有参数设置为0
- * @param[in] mode        发送模式，1代表可靠传输类似TCP（必达，有序，不重复），0不保证可靠性类似UDP
- * @return                错误码，0代表成功，其他见CommProtocolErrorCode
+ * @brief Assemble and send a packet through the protocol stack
+ * 
+ * Supports both reliable (TCP-like) and unreliable (UDP-like) transmission.
+ * In reliable mode, the function blocks until ACK is received or timeout.
+ * 
+ * @param[in] cmd         Command ID [1-10000], globally unique message type
+ * @param[in] payload     Message payload data, NULL if no payload
+ * @param[in] payload_len Payload length in bytes, 0 if no payload
+ * @param[in] mode        1 = reliable (TCP-like), 0 = unreliable (UDP-like)
+ * @return Error code (see CommProtocolErrorCode)
+ * @retval 0 Success
+ * @retval E_UNI_COMM_ALLOC_FAILED Memory allocation failed
+ * @retval E_UNI_COMM_PAYLOAD_TOO_LONG Payload exceeds max size
+ * @retval E_UNI_COMM_PAYLOAD_ACK_TIMEOUT ACK timeout (reliable mode only)
+ * @note Thread-safe if semaphore hooks are registered
+ * @warning Do NOT call from recv_handler callback
  */
 int CommProtocolPacketAssembleAndSend(CommCmd cmd, char *payload,
                                       CommPayloadLen payload_len,
                                       int mode);
 
 /**
- * @brief     协议栈入口函数，即从串口接收的数据入口，通过该接口解析出struct CommPacket
- * @param[in] buf 串口接收到的数据buffer
- * @param[in] len 串口接收到的数据长度
- * @return    void
+ * @brief Feed received UART data into the protocol stack for parsing
+ * 
+ * Call this function from your UART receive interrupt/thread to process
+ * incoming data. The protocol will parse frames and invoke recv_handler
+ * callback when complete packets are received.
+ * 
+ * @param[in] buf Received UART data buffer
+ * @param[in] len Length of received data in bytes
+ * @note Can be called with partial frame data, protocol handles buffering
+ * @note Thread-safe if semaphore hooks are registered
  */
 void CommProtocolReceiveUartData(unsigned char *buf, int len);
 
 #ifdef __cplusplus
 }
 #endif
-#endif  // UNI_COMMUNICATION_H_
+
+#if defined(_MSC_VER) && !defined(PACKED)
+#pragma pack(pop)
+#endif
+
+#endif  /* UNI_COMMUNICATION_H_ */
